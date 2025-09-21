@@ -14,14 +14,19 @@ logger = logging.getLogger(__name__)
 UNA_SEGMENT = "UNA:+.? '"
 ORDERS_MSG_TYPE = "ORDERS"
 DATE_FORMAT = "102"
-# Release char '?' must be escaped first to avoid double-escaping inserted release chars
-EDIFACT_SPECIAL_CHARS = ["?", "'", "+", ":", "*"]
+
+# Supported EDIFACT date formats
+DATE_FORMATS: Dict[str, str] = {
+    "102": "%Y%m%d",
+    "203": "%Y%m%d%H%M",
+}
 
 class OrderItem(TypedDict):
     product_code: str
     description: str
     quantity: int
     price: Decimal
+    unit: Optional[str]
 
 class OrderParty(TypedDict, total=False):
     qualifier: str
@@ -53,6 +58,7 @@ class EdifactConfig:
     release: str = "96A"
     controlling_agency: str = "UN"
     decimal_rounding: str = "0.01"
+    line_ending: str = "\n"  # can be set to "\r\n" if required
 
 class SegmentGenerator:
     """Helper class for EDIFACT segment generation"""
@@ -62,86 +68,84 @@ class SegmentGenerator:
         if value is None:
             return ""
         s = str(value)
-        # escape '?' first then others
-        for char in EDIFACT_SPECIAL_CHARS:
+        # escape '?' first
+        s = s.replace("?", "??")
+        for char in ["'", "+", ":", "*"]:
             s = s.replace(char, f"?{char}")
         return s
 
     @classmethod
     def una(cls, config: EdifactConfig) -> str:
-        # UNA defines separators; it's typically the literal UNA segment
         return config.una_segment
 
     @classmethod
     def unh(cls, message_ref: str, config: EdifactConfig) -> str:
-        return f"UNH+{SegmentGenerator.escape_edifact(message_ref)}+{config.message_type}:{config.version}:{config.release}:{config.controlling_agency}'"
+        return f"UNH+{cls.escape_edifact(message_ref)}+{config.message_type}:{config.version}:{config.release}:{config.controlling_agency}'"
 
     @classmethod
     def bgm(cls, order_number: str) -> str:
-        return f"BGM+220+{SegmentGenerator.escape_edifact(order_number)}+9'"
+        return f"BGM+220+{cls.escape_edifact(order_number)}+9'"
 
     @classmethod
     def dtm(cls, qualifier: str, date: str, date_format: str) -> str:
-        return f"DTM+{qualifier}:{SegmentGenerator.escape_edifact(date)}:{date_format}'"
+        return f"DTM+{qualifier}:{cls.escape_edifact(date)}:{date_format}'"
 
     @classmethod
     def nad(cls, qualifier: str, party_id: str, name: Optional[str] = None) -> List[str]:
-        segments = [f"NAD+{SegmentGenerator.escape_edifact(qualifier)}+{SegmentGenerator.escape_edifact(party_id)}::91'"]
+        base = f"NAD+{cls.escape_edifact(qualifier)}+{cls.escape_edifact(party_id)}::91"
         if name:
-            segments.append(f"CTA+IC+{SegmentGenerator.escape_edifact(name)}'")
-        return segments
+            return [f"{base}++{cls.escape_edifact(name)}'"]
+        return [f"{base}'"]
 
     @classmethod
     def com(cls, contact: str, contact_type: str = "TE") -> str:
-        return f"COM+{SegmentGenerator.escape_edifact(contact)}:{SegmentGenerator.escape_edifact(contact_type)}'"
+        return f"COM+{cls.escape_edifact(contact)}:{cls.escape_edifact(contact_type)}'"
 
     @classmethod
     def lin(cls, line_num: int, product_code: str) -> str:
-        return f"LIN+{line_num}++{SegmentGenerator.escape_edifact(product_code)}:EN'"
+        return f"LIN+{line_num}++{cls.escape_edifact(product_code)}:EN'"
 
     @classmethod
     def imd(cls, description: str) -> str:
-        return f"IMD+F++:::{SegmentGenerator.escape_edifact(description)}'"
+        return f"IMD+F++:::{cls.escape_edifact(description)}'"
 
     @classmethod
     def qty(cls, quantity: int, unit: str = "EA") -> str:
-        return f"QTY+21:{quantity}:{SegmentGenerator.escape_edifact(unit)}'"
+        return f"QTY+21:{quantity}:{cls.escape_edifact(unit)}'"
 
     @classmethod
-    def pri(cls, price: Decimal, config: EdifactConfig) -> str:
+    def pri(cls, price: Decimal, config: EdifactConfig, unit: str = "EA") -> str:
         q = price.quantize(Decimal(config.decimal_rounding), rounding=ROUND_HALF_UP)
-        return f"PRI+AAA:{q}:{SegmentGenerator.escape_edifact('EA')}'"
+        return f"PRI+AAA:{q}:{cls.escape_edifact(unit)}'"
 
     @classmethod
     def moa(cls, qualifier: str, amount: Decimal, config: EdifactConfig) -> str:
         q = amount.quantize(Decimal(config.decimal_rounding), rounding=ROUND_HALF_UP)
-        return f"MOA+{SegmentGenerator.escape_edifact(qualifier)}:{q}'"
+        return f"MOA+{cls.escape_edifact(qualifier)}:{q}'"
 
     @classmethod
     def tax(cls, rate: Decimal, tax_type: str = "VAT", config: Optional[EdifactConfig] = None) -> str:
-        # represent rate as numeric with rounding
-        if config is None:
-            fmt_rate = rate
-        else:
+        if config:
             fmt_rate = rate.quantize(Decimal(config.decimal_rounding), rounding=ROUND_HALF_UP)
-        # TAX segment uses a specific structure; keep it simple here
-        return f"TAX+7+{SegmentGenerator.escape_edifact(tax_type)}+++:::{fmt_rate}'"
+        else:
+            fmt_rate = rate
+        return f"TAX+7+{cls.escape_edifact(tax_type)}+++:::{fmt_rate}'"
 
     @classmethod
     def loc(cls, qualifier: str, location: str) -> str:
-        return f"LOC+{SegmentGenerator.escape_edifact(qualifier)}+{SegmentGenerator.escape_edifact(location)}:92'"
+        return f"LOC+{cls.escape_edifact(qualifier)}+{cls.escape_edifact(location)}:92'"
 
     @classmethod
     def pai(cls, terms: str) -> str:
-        return f"PAI+{SegmentGenerator.escape_edifact(terms)}:3'"
+        return f"PAI+{cls.escape_edifact(terms)}:3'"
 
     @classmethod
     def tod(cls, incoterms: str) -> str:
-        return f"TOD+5++{SegmentGenerator.escape_edifact(incoterms)}'"
+        return f"TOD+5++{cls.escape_edifact(incoterms)}'"
 
     @classmethod
     def unt(cls, segment_count: int, message_ref: str) -> str:
-        return f"UNT+{segment_count}+{SegmentGenerator.escape_edifact(message_ref)}'"
+        return f"UNT+{segment_count}+{cls.escape_edifact(message_ref)}'"
 
 class EdifactGenerationError(Exception):
     def __init__(self, message: str, code: str = "EDIFACT_001"):
@@ -150,21 +154,15 @@ class EdifactGenerationError(Exception):
 
 def validate_date(date_str: str, date_format: str) -> bool:
     try:
-        if date_format == "102":
-            datetime.strptime(date_str, "%Y%m%d")
-        elif date_format == "203":
-            datetime.strptime(date_str, "%Y%m%d%H%M")
-        else:
-            # unknown formats should be rejected
+        fmt = DATE_FORMATS.get(date_format)
+        if not fmt:
             return False
+        datetime.strptime(date_str, fmt)
         return True
     except (ValueError, TypeError):
         return False
 
 def validate_order_data(data: Dict[str, Any], config: EdifactConfig) -> OrderData:
-    """
-    Validate and normalize order data. Returns a validated copy (does not mutate input).
-    """
     data_copy = copy.deepcopy(data)
     required_fields = ["message_ref", "order_number", "order_date", "parties", "items"]
     if not all(field in data_copy for field in required_fields):
@@ -186,7 +184,8 @@ def validate_order_data(data: Dict[str, Any], config: EdifactConfig) -> OrderDat
                 "product_code": str(item["product_code"]),
                 "description": str(item.get("description", "")),
                 "quantity": int(item["quantity"]),
-                "price": Decimal(str(item["price"]))
+                "price": Decimal(str(item["price"])),
+                "unit": str(item.get("unit", "EA"))
             }
             converted_items.append(converted_item)
         data_copy["items"] = converted_items
@@ -196,7 +195,6 @@ def validate_order_data(data: Dict[str, Any], config: EdifactConfig) -> OrderDat
     except (ValueError, TypeError, KeyError) as e:
         raise EdifactGenerationError(f"Invalid numeric format: {str(e)}", "VALID_005")
 
-    # Parties: ensure required keys exist minimally
     for p in data_copy.get("parties", []):
         if "qualifier" not in p or "id" not in p:
             raise EdifactGenerationError("Party entries must contain qualifier and id", "VALID_006")
@@ -242,19 +240,19 @@ def generate_edifact_orders(
     for idx, item in enumerate(validated_data["items"], 1):
         quantity = int(item["quantity"])
         price: Decimal = item["price"]
+        unit = item.get("unit", "EA") or "EA"
         line_total = (price * Decimal(quantity)).quantize(Decimal(config.decimal_rounding), rounding=ROUND_HALF_UP)
 
         segments.extend([
             SegmentGenerator.lin(idx, item["product_code"]),
             SegmentGenerator.imd(item["description"]),
-            SegmentGenerator.qty(quantity),
-            SegmentGenerator.pri(price, config)
+            SegmentGenerator.qty(quantity, unit),
+            SegmentGenerator.pri(price, config, unit)
         ])
         total_amount += line_total
 
     if validated_data.get("tax_rate") is not None:
         tax_rate: Decimal = validated_data["tax_rate"]
-        # tax amount in currency units
         tax_amount = (total_amount * tax_rate / Decimal("100")).quantize(Decimal(config.decimal_rounding), rounding=ROUND_HALF_UP)
         segments.extend([
             SegmentGenerator.tax(tax_rate, "VAT", config),
@@ -271,10 +269,8 @@ def generate_edifact_orders(
     if validated_data.get("incoterms"):
         segments.append(SegmentGenerator.tod(validated_data["incoterms"]))
 
-    # Document total
     segments.append(SegmentGenerator.moa("79", total_amount, config))
 
-    # Flatten segments (some generators return list of segments)
     flat_segments: List[str] = []
     for seg in segments:
         if isinstance(seg, list):
@@ -282,7 +278,6 @@ def generate_edifact_orders(
         else:
             flat_segments.append(seg)
 
-    # Determine UNH index (count segments from UNH through UNT inclusive)
     unh_index = None
     for i, s in enumerate(flat_segments):
         if s.startswith("UNH+"):
@@ -292,17 +287,14 @@ def generate_edifact_orders(
     if unh_index is None:
         raise EdifactGenerationError("UNH segment missing", "GEN_001")
 
-    # UNT must count segments from UNH to UNT inclusive; UNT not yet appended so +1 for UNT itself
     segment_count = len(flat_segments) - unh_index + 1
-    # Append UNT
     flat_segments.append(SegmentGenerator.unt(segment_count, validated_data["message_ref"]))
 
-    # Join with CRLF or newline — many systems prefer newline; keep apostrophes as segment terminators
-    edifact_message = "\n".join(flat_segments)
+    edifact_message = config.line_ending.join(flat_segments)
 
     if output_file:
         try:
-            with open(output_file, "w", encoding="utf-8", newline="\n") as f:
+            with open(output_file, "w", encoding="utf-8", newline="") as f:
                 f.write(edifact_message)
             logger.info(f"EDIFACT message written to {output_file}")
         except IOError as e:
@@ -311,7 +303,7 @@ def generate_edifact_orders(
 
     return edifact_message
 
-# Example usage (kept similar to original)
+# Example usage
 if __name__ == "__main__":
     sample_order = {
         "message_ref": "ORD0001",
@@ -336,7 +328,8 @@ if __name__ == "__main__":
                 "product_code": "ITEM001",
                 "description": "Widget A (Special)",
                 "quantity": 10,
-                "price": Decimal("12.50")
+                "price": Decimal("12.50"),
+                "unit": "EA"
             },
         ],
         "delivery_date": "20250515",
@@ -350,7 +343,8 @@ if __name__ == "__main__":
     enhanced_config = EdifactConfig(
         version="4",
         release="22A",
-        controlling_agency="ISO"
+        controlling_agency="ISO",
+        line_ending="\r\n"
     )
 
     try:
