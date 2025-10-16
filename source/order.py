@@ -6,19 +6,18 @@ from datetime import datetime
 from typing import Dict, List, Optional, TypedDict, Union, Any, cast
 import copy
 
-# Configure logging
 logging.basicConfig(level=logging.INFO, format="%(levelname)s: %(message)s")
 logger = logging.getLogger(__name__)
 
-# Constants
 UNA_SEGMENT = "UNA:+.? '"
 ORDERS_MSG_TYPE = "ORDERS"
 DATE_FORMAT = "102"
 
-# Supported EDIFACT date formats
 DATE_FORMATS: Dict[str, str] = {
     "102": "%Y%m%d",
     "203": "%Y%m%d%H%M",
+    "101": "%y%m%d",
+    "204": "%Y%m%d%H%M%S",
 }
 
 class OrderItem(TypedDict):
@@ -58,33 +57,42 @@ class EdifactConfig:
     release: str = "96A"
     controlling_agency: str = "UN"
     decimal_rounding: str = "0.01"
-    line_ending: str = "\n"  # can be set to "\r\n" if required
+    line_ending: str = "\n"
+    include_una: bool = True
+    sender_id: str = "SENDER"
+    receiver_id: str = "RECEIVER"
 
 class SegmentGenerator:
-    """Helper class for EDIFACT segment generation"""
-
     @staticmethod
     def escape_edifact(value: Optional[str]) -> str:
         if value is None:
             return ""
         s = str(value)
-        # escape '?' first
         s = s.replace("?", "??")
         for char in ["'", "+", ":", "*"]:
             s = s.replace(char, f"?{char}")
         return s
 
     @classmethod
+    def unb(cls, config: EdifactConfig, message_ref: str) -> str:
+        timestamp = datetime.now().strftime("%y%m%d%H%M")
+        return f"UNB+UNOA:2+{cls.escape_edifact(config.sender_id)}+{cls.escape_edifact(config.receiver_id)}+{timestamp}+{cls.escape_edifact(message_ref)}'"
+
+    @classmethod
     def una(cls, config: EdifactConfig) -> str:
         return config.una_segment
+
+    @classmethod
+    def unz(cls, message_count: int = 1, message_ref: str = "") -> str:
+        return f"UNZ+{message_count}+{cls.escape_edifact(message_ref)}'"
 
     @classmethod
     def unh(cls, message_ref: str, config: EdifactConfig) -> str:
         return f"UNH+{cls.escape_edifact(message_ref)}+{config.message_type}:{config.version}:{config.release}:{config.controlling_agency}'"
 
     @classmethod
-    def bgm(cls, order_number: str) -> str:
-        return f"BGM+220+{cls.escape_edifact(order_number)}+9'"
+    def bgm(cls, order_number: str, document_type: str = "220") -> str:
+        return f"BGM+{document_type}+{cls.escape_edifact(order_number)}+9'"
 
     @classmethod
     def dtm(cls, qualifier: str, date: str, date_format: str) -> str:
@@ -153,10 +161,10 @@ class EdifactGenerationError(Exception):
         super().__init__(f"{code}: {message}")
 
 def validate_date(date_str: str, date_format: str) -> bool:
+    fmt = DATE_FORMATS.get(date_format)
+    if not fmt:
+        return False
     try:
-        fmt = DATE_FORMATS.get(date_format)
-        if not fmt:
-            return False
         datetime.strptime(date_str, fmt)
         return True
     except (ValueError, TypeError):
@@ -213,11 +221,17 @@ def generate_edifact_orders(
         raise
 
     segments: List[Union[str, List[str]]] = [
-        SegmentGenerator.una(config),
+        SegmentGenerator.unb(config, validated_data["message_ref"])
+    ]
+
+    if config.include_una:
+        segments.append(SegmentGenerator.una(config))
+
+    segments.extend([
         SegmentGenerator.unh(validated_data["message_ref"], config),
         SegmentGenerator.bgm(validated_data["order_number"]),
         SegmentGenerator.dtm("137", validated_data["order_date"], config.date_format)
-    ]
+    ])
 
     if validated_data.get("delivery_date"):
         segments.append(SegmentGenerator.dtm("2", validated_data["delivery_date"], config.date_format))
@@ -287,8 +301,9 @@ def generate_edifact_orders(
     if unh_index is None:
         raise EdifactGenerationError("UNH segment missing", "GEN_001")
 
-    segment_count = len(flat_segments) - unh_index + 1
+    segment_count = len(flat_segments) - unh_index
     flat_segments.append(SegmentGenerator.unt(segment_count, validated_data["message_ref"]))
+    flat_segments.append(SegmentGenerator.unz(1, validated_data["message_ref"]))
 
     edifact_message = config.line_ending.join(flat_segments)
 
@@ -303,7 +318,6 @@ def generate_edifact_orders(
 
     return edifact_message
 
-# Example usage
 if __name__ == "__main__":
     sample_order = {
         "message_ref": "ORD0001",
@@ -344,7 +358,9 @@ if __name__ == "__main__":
         version="4",
         release="22A",
         controlling_agency="ISO",
-        line_ending="\r\n"
+        line_ending="\r\n",
+        sender_id="BUYER123",
+        receiver_id="SUPPLIER456"
     )
 
     try:
