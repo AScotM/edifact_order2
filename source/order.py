@@ -1,10 +1,13 @@
 #!/usr/bin/env python3
 import logging
+import os
+import re
 from dataclasses import dataclass
 from decimal import Decimal, ROUND_HALF_UP
 from datetime import datetime
 from typing import Dict, List, Optional, TypedDict, Union, Any, cast
 import copy
+from jsonschema import validate, ValidationError
 
 logging.basicConfig(level=logging.INFO, format="%(levelname)s: %(message)s")
 logger = logging.getLogger(__name__)
@@ -61,6 +64,19 @@ class EdifactConfig:
     include_una: bool = True
     sender_id: str = "SENDER"
     receiver_id: str = "RECEIVER"
+    max_segment_length: int = 2000
+    max_field_length: int = 70
+    allowed_qualifiers: List[str] = None
+    
+    def __post_init__(self):
+        if self.allowed_qualifiers is None:
+            self.allowed_qualifiers = ["BY", "SU", "DP", "IV", "CB"]
+
+class EdifactGenerationError(Exception):
+    def __init__(self, message: str, code: str = "EDIFACT_001", details: Optional[Dict] = None):
+        self.code = code
+        self.details = details or {}
+        super().__init__(f"{code}: {message}")
 
 class SegmentGenerator:
     @staticmethod
@@ -68,15 +84,27 @@ class SegmentGenerator:
         if value is None:
             return ""
         s = str(value)
+        s = re.sub(r'[\x00-\x1F\x7F]', '', s)
         s = s.replace("?", "??")
         for char in ["'", "+", ":", "*"]:
             s = s.replace(char, f"?{char}")
         return s
 
     @classmethod
+    def validate_segment_length(cls, segment: str, config: EdifactConfig) -> None:
+        if len(segment) > config.max_segment_length:
+            raise EdifactGenerationError(
+                f"Segment too long: {len(segment)} > {config.max_segment_length}",
+                "SEGMENT_001",
+                {"segment": segment[:100], "length": len(segment)}
+            )
+
+    @classmethod
     def unb(cls, config: EdifactConfig, message_ref: str) -> str:
         timestamp = datetime.now().strftime("%y%m%d%H%M")
-        return f"UNB+UNOA:2+{cls.escape_edifact(config.sender_id)}+{cls.escape_edifact(config.receiver_id)}+{timestamp}+{cls.escape_edifact(message_ref)}'"
+        segment = f"UNB+UNOA:2+{cls.escape_edifact(config.sender_id)}+{cls.escape_edifact(config.receiver_id)}+{timestamp}+{cls.escape_edifact(message_ref)}'"
+        cls.validate_segment_length(segment, config)
+        return segment
 
     @classmethod
     def una(cls, config: EdifactConfig) -> str:
@@ -84,52 +112,86 @@ class SegmentGenerator:
 
     @classmethod
     def unz(cls, message_count: int = 1, message_ref: str = "") -> str:
-        return f"UNZ+{message_count}+{cls.escape_edifact(message_ref)}'"
+        segment = f"UNZ+{message_count}+{cls.escape_edifact(message_ref)}'"
+        return segment
 
     @classmethod
     def unh(cls, message_ref: str, config: EdifactConfig) -> str:
-        return f"UNH+{cls.escape_edifact(message_ref)}+{config.message_type}:{config.version}:{config.release}:{config.controlling_agency}'"
+        segment = f"UNH+{cls.escape_edifact(message_ref)}+{config.message_type}:{config.version}:{config.release}:{config.controlling_agency}'"
+        cls.validate_segment_length(segment, config)
+        return segment
 
     @classmethod
-    def bgm(cls, order_number: str, document_type: str = "220") -> str:
-        return f"BGM+{document_type}+{cls.escape_edifact(order_number)}+9'"
+    def bgm(cls, order_number: str, document_type: str = "220", config: Optional[EdifactConfig] = None) -> str:
+        segment = f"BGM+{document_type}+{cls.escape_edifact(order_number)}+9'"
+        if config:
+            cls.validate_segment_length(segment, config)
+        return segment
 
     @classmethod
-    def dtm(cls, qualifier: str, date: str, date_format: str) -> str:
-        return f"DTM+{qualifier}:{cls.escape_edifact(date)}:{date_format}'"
+    def dtm(cls, qualifier: str, date: str, date_format: str, config: Optional[EdifactConfig] = None) -> str:
+        segment = f"DTM+{qualifier}:{cls.escape_edifact(date)}:{date_format}'"
+        if config:
+            cls.validate_segment_length(segment, config)
+        return segment
 
     @classmethod
-    def nad(cls, qualifier: str, party_id: str, name: Optional[str] = None) -> List[str]:
+    def nad(cls, qualifier: str, party_id: str, name: Optional[str] = None, config: Optional[EdifactConfig] = None) -> List[str]:
         base = f"NAD+{cls.escape_edifact(qualifier)}+{cls.escape_edifact(party_id)}::91"
         if name:
-            return [f"{base}++{cls.escape_edifact(name)}'"]
-        return [f"{base}'"]
+            if len(name) > (config.max_field_length if config else 70):
+                name = name[:config.max_field_length] if config else name[:70]
+            segment = f"{base}++{cls.escape_edifact(name)}'"
+        else:
+            segment = f"{base}'"
+        
+        if config:
+            cls.validate_segment_length(segment, config)
+        return [segment]
 
     @classmethod
-    def com(cls, contact: str, contact_type: str = "TE") -> str:
-        return f"COM+{cls.escape_edifact(contact)}:{cls.escape_edifact(contact_type)}'"
+    def com(cls, contact: str, contact_type: str = "TE", config: Optional[EdifactConfig] = None) -> str:
+        segment = f"COM+{cls.escape_edifact(contact)}:{cls.escape_edifact(contact_type)}'"
+        if config:
+            cls.validate_segment_length(segment, config)
+        return segment
 
     @classmethod
-    def lin(cls, line_num: int, product_code: str) -> str:
-        return f"LIN+{line_num}++{cls.escape_edifact(product_code)}:EN'"
+    def lin(cls, line_num: int, product_code: str, config: Optional[EdifactConfig] = None) -> str:
+        segment = f"LIN+{line_num}++{cls.escape_edifact(product_code)}:EN'"
+        if config:
+            cls.validate_segment_length(segment, config)
+        return segment
 
     @classmethod
-    def imd(cls, description: str) -> str:
-        return f"IMD+F++:::{cls.escape_edifact(description)}'"
+    def imd(cls, description: str, config: Optional[EdifactConfig] = None) -> str:
+        if len(description) > (config.max_field_length if config else 70):
+            description = description[:config.max_field_length] if config else description[:70]
+        segment = f"IMD+F++:::{cls.escape_edifact(description)}'"
+        if config:
+            cls.validate_segment_length(segment, config)
+        return segment
 
     @classmethod
-    def qty(cls, quantity: int, unit: str = "EA") -> str:
-        return f"QTY+21:{quantity}:{cls.escape_edifact(unit)}'"
+    def qty(cls, quantity: int, unit: str = "EA", config: Optional[EdifactConfig] = None) -> str:
+        segment = f"QTY+21:{quantity}:{cls.escape_edifact(unit)}'"
+        if config:
+            cls.validate_segment_length(segment, config)
+        return segment
 
     @classmethod
     def pri(cls, price: Decimal, config: EdifactConfig, unit: str = "EA") -> str:
         q = price.quantize(Decimal(config.decimal_rounding), rounding=ROUND_HALF_UP)
-        return f"PRI+AAA:{q}:{cls.escape_edifact(unit)}'"
+        segment = f"PRI+AAA:{q}:{cls.escape_edifact(unit)}'"
+        cls.validate_segment_length(segment, config)
+        return segment
 
     @classmethod
     def moa(cls, qualifier: str, amount: Decimal, config: EdifactConfig) -> str:
         q = amount.quantize(Decimal(config.decimal_rounding), rounding=ROUND_HALF_UP)
-        return f"MOA+{cls.escape_edifact(qualifier)}:{q}'"
+        segment = f"MOA+{cls.escape_edifact(qualifier)}:{q}'"
+        cls.validate_segment_length(segment, config)
+        return segment
 
     @classmethod
     def tax(cls, rate: Decimal, tax_type: str = "VAT", config: Optional[EdifactConfig] = None) -> str:
@@ -137,28 +199,47 @@ class SegmentGenerator:
             fmt_rate = rate.quantize(Decimal(config.decimal_rounding), rounding=ROUND_HALF_UP)
         else:
             fmt_rate = rate
-        return f"TAX+7+{cls.escape_edifact(tax_type)}+++:::{fmt_rate}'"
+        segment = f"TAX+7+{cls.escape_edifact(tax_type)}+++:::{fmt_rate}'"
+        if config:
+            cls.validate_segment_length(segment, config)
+        return segment
 
     @classmethod
-    def loc(cls, qualifier: str, location: str) -> str:
-        return f"LOC+{cls.escape_edifact(qualifier)}+{cls.escape_edifact(location)}:92'"
+    def loc(cls, qualifier: str, location: str, config: Optional[EdifactConfig] = None) -> str:
+        segment = f"LOC+{cls.escape_edifact(qualifier)}+{cls.escape_edifact(location)}:92'"
+        if config:
+            cls.validate_segment_length(segment, config)
+        return segment
 
     @classmethod
-    def pai(cls, terms: str) -> str:
-        return f"PAI+{cls.escape_edifact(terms)}:3'"
+    def pai(cls, terms: str, config: Optional[EdifactConfig] = None) -> str:
+        segment = f"PAI+{cls.escape_edifact(terms)}:3'"
+        if config:
+            cls.validate_segment_length(segment, config)
+        return segment
 
     @classmethod
-    def tod(cls, incoterms: str) -> str:
-        return f"TOD+5++{cls.escape_edifact(incoterms)}'"
+    def tod(cls, incoterms: str, config: Optional[EdifactConfig] = None) -> str:
+        segment = f"TOD+5++{cls.escape_edifact(incoterms)}'"
+        if config:
+            cls.validate_segment_length(segment, config)
+        return segment
 
     @classmethod
-    def unt(cls, segment_count: int, message_ref: str) -> str:
-        return f"UNT+{segment_count}+{cls.escape_edifact(message_ref)}'"
+    def unt(cls, segment_count: int, message_ref: str, config: Optional[EdifactConfig] = None) -> str:
+        segment = f"UNT+{segment_count}+{cls.escape_edifact(message_ref)}'"
+        if config:
+            cls.validate_segment_length(segment, config)
+        return segment
 
-class EdifactGenerationError(Exception):
-    def __init__(self, message: str, code: str = "EDIFACT_001"):
-        self.code = code
-        super().__init__(f"{code}: {message}")
+    @classmethod
+    def ftx(cls, text: str, qualifier: str = "AAI", sequence: int = 1, config: Optional[EdifactConfig] = None) -> str:
+        if len(text) > (config.max_field_length if config else 70):
+            text = text[:config.max_field_length] if config else text[:70]
+        segment = f"FTX+{qualifier}+{sequence}+++{cls.escape_edifact(text)}'"
+        if config:
+            cls.validate_segment_length(segment, config)
+        return segment
 
 def validate_date(date_str: str, date_format: str) -> bool:
     fmt = DATE_FORMATS.get(date_format)
@@ -170,24 +251,58 @@ def validate_date(date_str: str, date_format: str) -> bool:
     except (ValueError, TypeError):
         return False
 
+def sanitize_input(data: Dict[str, Any]) -> Dict[str, Any]:
+    sanitized = {}
+    for key, value in data.items():
+        if isinstance(value, str):
+            sanitized[key] = re.sub(r'[\x00-\x1F\x7F]', '', value)
+        elif isinstance(value, dict):
+            sanitized[key] = sanitize_input(value)
+        elif isinstance(value, list):
+            sanitized[key] = [sanitize_input(item) if isinstance(item, dict) else item for item in value]
+        else:
+            sanitized[key] = value
+    return sanitized
+
 def validate_order_data(data: Dict[str, Any], config: EdifactConfig) -> OrderData:
-    data_copy = copy.deepcopy(data)
+    data_copy = sanitize_input(copy.deepcopy(data))
+    
     required_fields = ["message_ref", "order_number", "order_date", "parties", "items"]
-    if not all(field in data_copy for field in required_fields):
-        raise EdifactGenerationError("Missing required fields", "VALID_001")
+    missing_fields = [field for field in required_fields if field not in data_copy]
+    if missing_fields:
+        raise EdifactGenerationError(
+            f"Missing required fields: {', '.join(missing_fields)}",
+            "VALID_001",
+            {"missing_fields": missing_fields}
+        )
 
     if not isinstance(data_copy["items"], list) or not data_copy["items"]:
         raise EdifactGenerationError("At least one item is required", "VALID_002")
 
     if not validate_date(data_copy["order_date"], config.date_format):
-        raise EdifactGenerationError(f"Invalid order_date format for {config.date_format}", "VALID_003")
+        raise EdifactGenerationError(
+            f"Invalid order_date format for {config.date_format}",
+            "VALID_003",
+            {"date": data_copy["order_date"], "format": config.date_format}
+        )
 
     if "delivery_date" in data_copy and data_copy.get("delivery_date") and not validate_date(data_copy["delivery_date"], config.date_format):
-        raise EdifactGenerationError(f"Invalid delivery_date format for {config.date_format}", "VALID_004")
+        raise EdifactGenerationError(
+            f"Invalid delivery_date format for {config.date_format}",
+            "VALID_004",
+            {"date": data_copy["delivery_date"], "format": config.date_format}
+        )
 
     try:
         converted_items: List[OrderItem] = []
-        for item in data_copy["items"]:
+        for idx, item in enumerate(data_copy["items"]):
+            if len(item.get("product_code", "")) > 35:
+                raise EdifactGenerationError(
+                    f"Product code too long in item {idx}",
+                    "VALID_007",
+                    {"item_index": idx, "field": "product_code", "length": len(item["product_code"])}
+                )
+            
             converted_item: OrderItem = {
                 "product_code": str(item["product_code"]),
                 "description": str(item.get("description", "")),
@@ -203,11 +318,30 @@ def validate_order_data(data: Dict[str, Any], config: EdifactConfig) -> OrderDat
     except (ValueError, TypeError, KeyError) as e:
         raise EdifactGenerationError(f"Invalid numeric format: {str(e)}", "VALID_005")
 
-    for p in data_copy.get("parties", []):
+    for idx, p in enumerate(data_copy.get("parties", [])):
         if "qualifier" not in p or "id" not in p:
-            raise EdifactGenerationError("Party entries must contain qualifier and id", "VALID_006")
+            raise EdifactGenerationError(
+                f"Party {idx} must contain qualifier and id",
+                "VALID_006",
+                {"party_index": idx}
+            )
+        
+        if p["qualifier"] not in config.allowed_qualifiers:
+            raise EdifactGenerationError(
+                f"Invalid qualifier '{p['qualifier']}' in party {idx}",
+                "VALID_008",
+                {"party_index": idx, "qualifier": p["qualifier"], "allowed": config.allowed_qualifiers}
+            )
 
     return cast(OrderData, data_copy)
+
+def validate_file_path(filename: str) -> None:
+    safe_filename = os.path.basename(filename)
+    if safe_filename != filename:
+        raise EdifactGenerationError("Invalid filename provided", "IO_002")
+    
+    if not filename.lower().endswith(('.edi', '.edifact')):
+        logger.warning("Recommended file extension is .edi or .edifact")
 
 def generate_edifact_orders(
     data: Dict[str, Any],
@@ -217,38 +351,42 @@ def generate_edifact_orders(
     try:
         validated_data = validate_order_data(data, config)
     except EdifactGenerationError as e:
-        logger.error(f"Validation failed: {e}")
+        logger.error(f"Validation failed: {e.code} - {e}")
+        if e.details:
+            logger.error(f"Details: {e.details}")
         raise
 
-    segments: List[Union[str, List[str]]] = [
-        SegmentGenerator.unb(config, validated_data["message_ref"])
-    ]
+    segments: List[Union[str, List[str]]] = []
 
     if config.include_una:
         segments.append(SegmentGenerator.una(config))
 
+    segments.append(SegmentGenerator.unb(config, validated_data["message_ref"]))
     segments.extend([
         SegmentGenerator.unh(validated_data["message_ref"], config),
-        SegmentGenerator.bgm(validated_data["order_number"]),
-        SegmentGenerator.dtm("137", validated_data["order_date"], config.date_format)
+        SegmentGenerator.bgm(validated_data["order_number"], "220", config),
+        SegmentGenerator.dtm("137", validated_data["order_date"], config.date_format, config)
     ])
 
     if validated_data.get("delivery_date"):
-        segments.append(SegmentGenerator.dtm("2", validated_data["delivery_date"], config.date_format))
+        segments.append(SegmentGenerator.dtm("2", validated_data["delivery_date"], config.date_format, config))
 
     if validated_data.get("currency"):
-        segments.append(f"CUX+2:{SegmentGenerator.escape_edifact(validated_data['currency'])}:9'")
+        currency_segment = f"CUX+2:{SegmentGenerator.escape_edifact(validated_data['currency'])}:9'"
+        SegmentGenerator.validate_segment_length(currency_segment, config)
+        segments.append(currency_segment)
 
     for party in validated_data["parties"]:
         segments.extend(SegmentGenerator.nad(
             party["qualifier"],
             party["id"],
-            party.get("name")
+            party.get("name"),
+            config
         ))
         if party.get("address"):
-            segments.append(SegmentGenerator.com(party["address"], "AD"))
+            segments.append(SegmentGenerator.com(party["address"], "AD", config))
         if party.get("contact"):
-            segments.append(SegmentGenerator.com(party["contact"], "TE"))
+            segments.append(SegmentGenerator.com(party["contact"], "TE", config))
 
     total_amount = Decimal("0.00")
     for idx, item in enumerate(validated_data["items"], 1):
@@ -258,9 +396,9 @@ def generate_edifact_orders(
         line_total = (price * Decimal(quantity)).quantize(Decimal(config.decimal_rounding), rounding=ROUND_HALF_UP)
 
         segments.extend([
-            SegmentGenerator.lin(idx, item["product_code"]),
-            SegmentGenerator.imd(item["description"]),
-            SegmentGenerator.qty(quantity, unit),
+            SegmentGenerator.lin(idx, item["product_code"], config),
+            SegmentGenerator.imd(item["description"], config),
+            SegmentGenerator.qty(quantity, unit, config),
             SegmentGenerator.pri(price, config, unit)
         ])
         total_amount += line_total
@@ -275,13 +413,19 @@ def generate_edifact_orders(
         total_amount += tax_amount
 
     if validated_data.get("delivery_location"):
-        segments.append(SegmentGenerator.loc("11", validated_data["delivery_location"]))
+        segments.append(SegmentGenerator.loc("11", validated_data["delivery_location"], config))
 
     if validated_data.get("payment_terms"):
-        segments.append(SegmentGenerator.pai(validated_data["payment_terms"]))
+        segments.append(SegmentGenerator.pai(validated_data["payment_terms"], config))
 
     if validated_data.get("incoterms"):
-        segments.append(SegmentGenerator.tod(validated_data["incoterms"]))
+        segments.append(SegmentGenerator.tod(validated_data["incoterms"], config))
+
+    if validated_data.get("special_instructions"):
+        instructions = validated_data["special_instructions"]
+        chunks = [instructions[i:i+config.max_field_length] for i in range(0, len(instructions), config.max_field_length)]
+        for i, chunk in enumerate(chunks, 1):
+            segments.append(SegmentGenerator.ftx(chunk, "AAI", i, config))
 
     segments.append(SegmentGenerator.moa("79", total_amount, config))
 
@@ -302,13 +446,14 @@ def generate_edifact_orders(
         raise EdifactGenerationError("UNH segment missing", "GEN_001")
 
     segment_count = len(flat_segments) - unh_index
-    flat_segments.append(SegmentGenerator.unt(segment_count, validated_data["message_ref"]))
+    flat_segments.append(SegmentGenerator.unt(segment_count, validated_data["message_ref"], config))
     flat_segments.append(SegmentGenerator.unz(1, validated_data["message_ref"]))
 
     edifact_message = config.line_ending.join(flat_segments)
 
     if output_file:
         try:
+            validate_file_path(output_file)
             with open(output_file, "w", encoding="utf-8", newline="") as f:
                 f.write(edifact_message)
             logger.info(f"EDIFACT message written to {output_file}")
@@ -351,6 +496,7 @@ if __name__ == "__main__":
         "delivery_location": "WAREHOUSE1",
         "payment_terms": "NET30",
         "tax_rate": Decimal("7.5"),
+        "special_instructions": "Please deliver during business hours 9AM-5PM. Contact John Doe at extension 123 for delivery coordination.",
         "incoterms": "FOB"
     }
 
@@ -360,7 +506,9 @@ if __name__ == "__main__":
         controlling_agency="ISO",
         line_ending="\r\n",
         sender_id="BUYER123",
-        receiver_id="SUPPLIER456"
+        receiver_id="SUPPLIER456",
+        max_field_length=70,
+        max_segment_length=2000
     )
 
     try:
@@ -372,3 +520,5 @@ if __name__ == "__main__":
         print("\nGenerated EDIFACT ORDERS:\n", message)
     except EdifactGenerationError as e:
         print(f"Generation failed: {e.code} - {str(e)}")
+        if e.details:
+            print(f"Error details: {e.details}")
