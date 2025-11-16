@@ -23,6 +23,26 @@ DATE_FORMATS: Dict[str, str] = {
     "204": "%Y%m%d%H%M%S",
 }
 
+CONTROL_CHAR_REGEX = re.compile(r'[\x00-\x1F\x7F]')
+ESCAPE_CHARS = ["'", "+", ":", "*"]
+
+ORDER_SCHEMA = {
+    "type": "object",
+    "required": ["message_ref", "order_number", "order_date", "parties", "items"],
+    "properties": {
+        "message_ref": {"type": "string", "maxLength": 14},
+        "order_number": {"type": "string", "maxLength": 35},
+        "order_date": {"type": "string"},
+        "delivery_date": {"type": "string"},
+        "currency": {"type": "string", "maxLength": 3},
+        "delivery_location": {"type": "string", "maxLength": 35},
+        "payment_terms": {"type": "string", "maxLength": 35},
+        "tax_rate": {"type": "number"},
+        "special_instructions": {"type": "string"},
+        "incoterms": {"type": "string", "maxLength": 3}
+    }
+}
+
 class OrderItem(TypedDict):
     product_code: str
     description: str
@@ -71,6 +91,12 @@ class EdifactConfig:
     def __post_init__(self):
         if self.allowed_qualifiers is None:
             self.allowed_qualifiers = ["BY", "SU", "DP", "IV", "CB"]
+        
+        if not all(len(q) == 2 for q in self.allowed_qualifiers):
+            raise ValueError("All qualifiers must be 2 characters")
+        
+        if self.max_segment_length < 10:
+            raise ValueError("max_segment_length must be at least 10")
 
 class EdifactGenerationError(Exception):
     def __init__(self, message: str, code: str = "EDIFACT_001", details: Optional[Dict] = None):
@@ -84,9 +110,9 @@ class SegmentGenerator:
         if value is None:
             return ""
         s = str(value)
-        s = re.sub(r'[\x00-\x1F\x7F]', '', s)
+        s = CONTROL_CHAR_REGEX.sub('', s)
         s = s.replace("?", "??")
-        for char in ["'", "+", ":", "*"]:
+        for char in ESCAPE_CHARS:
             s = s.replace(char, f"?{char}")
         return s
 
@@ -97,6 +123,15 @@ class SegmentGenerator:
                 f"Segment too long: {len(segment)} > {config.max_segment_length}",
                 "SEGMENT_001",
                 {"segment": segment[:100], "length": len(segment)}
+            )
+
+    @classmethod
+    def validate_decimal_precision(cls, value: Decimal, config: EdifactConfig) -> None:
+        precision = Decimal(config.decimal_rounding)
+        if value != value.quantize(precision, rounding=ROUND_HALF_UP):
+            raise EdifactGenerationError(
+                f"Decimal value {value} exceeds configured precision {precision}",
+                "VALID_009"
             )
 
     @classmethod
@@ -111,8 +146,10 @@ class SegmentGenerator:
         return config.una_segment
 
     @classmethod
-    def unz(cls, message_count: int = 1, message_ref: str = "") -> str:
+    def unz(cls, message_count: int = 1, message_ref: str = "", config: Optional[EdifactConfig] = None) -> str:
         segment = f"UNZ+{message_count}+{cls.escape_edifact(message_ref)}'"
+        if config:
+            cls.validate_segment_length(segment, config)
         return segment
 
     @classmethod
@@ -123,64 +160,72 @@ class SegmentGenerator:
 
     @classmethod
     def bgm(cls, order_number: str, document_type: str = "220", config: Optional[EdifactConfig] = None) -> str:
+        if config is None:
+            config = EdifactConfig()
         segment = f"BGM+{document_type}+{cls.escape_edifact(order_number)}+9'"
-        if config:
-            cls.validate_segment_length(segment, config)
+        cls.validate_segment_length(segment, config)
         return segment
 
     @classmethod
     def dtm(cls, qualifier: str, date: str, date_format: str, config: Optional[EdifactConfig] = None) -> str:
+        if config is None:
+            config = EdifactConfig()
         segment = f"DTM+{qualifier}:{cls.escape_edifact(date)}:{date_format}'"
-        if config:
-            cls.validate_segment_length(segment, config)
+        cls.validate_segment_length(segment, config)
         return segment
 
     @classmethod
     def nad(cls, qualifier: str, party_id: str, name: Optional[str] = None, config: Optional[EdifactConfig] = None) -> List[str]:
+        if config is None:
+            config = EdifactConfig()
         base = f"NAD+{cls.escape_edifact(qualifier)}+{cls.escape_edifact(party_id)}::91"
         if name:
-            if len(name) > (config.max_field_length if config else 70):
-                name = name[:config.max_field_length] if config else name[:70]
+            if len(name) > config.max_field_length:
+                name = name[:config.max_field_length]
             segment = f"{base}++{cls.escape_edifact(name)}'"
         else:
             segment = f"{base}'"
         
-        if config:
-            cls.validate_segment_length(segment, config)
+        cls.validate_segment_length(segment, config)
         return [segment]
 
     @classmethod
     def com(cls, contact: str, contact_type: str = "TE", config: Optional[EdifactConfig] = None) -> str:
+        if config is None:
+            config = EdifactConfig()
         segment = f"COM+{cls.escape_edifact(contact)}:{cls.escape_edifact(contact_type)}'"
-        if config:
-            cls.validate_segment_length(segment, config)
+        cls.validate_segment_length(segment, config)
         return segment
 
     @classmethod
     def lin(cls, line_num: int, product_code: str, config: Optional[EdifactConfig] = None) -> str:
+        if config is None:
+            config = EdifactConfig()
         segment = f"LIN+{line_num}++{cls.escape_edifact(product_code)}:EN'"
-        if config:
-            cls.validate_segment_length(segment, config)
+        cls.validate_segment_length(segment, config)
         return segment
 
     @classmethod
     def imd(cls, description: str, config: Optional[EdifactConfig] = None) -> str:
-        if len(description) > (config.max_field_length if config else 70):
-            description = description[:config.max_field_length] if config else description[:70]
+        if config is None:
+            config = EdifactConfig()
+        if len(description) > config.max_field_length:
+            description = description[:config.max_field_length]
         segment = f"IMD+F++:::{cls.escape_edifact(description)}'"
-        if config:
-            cls.validate_segment_length(segment, config)
+        cls.validate_segment_length(segment, config)
         return segment
 
     @classmethod
     def qty(cls, quantity: int, unit: str = "EA", config: Optional[EdifactConfig] = None) -> str:
+        if config is None:
+            config = EdifactConfig()
         segment = f"QTY+21:{quantity}:{cls.escape_edifact(unit)}'"
-        if config:
-            cls.validate_segment_length(segment, config)
+        cls.validate_segment_length(segment, config)
         return segment
 
     @classmethod
     def pri(cls, price: Decimal, config: EdifactConfig, unit: str = "EA") -> str:
+        cls.validate_decimal_precision(price, config)
         q = price.quantize(Decimal(config.decimal_rounding), rounding=ROUND_HALF_UP)
         segment = f"PRI+AAA:{q}:{cls.escape_edifact(unit)}'"
         cls.validate_segment_length(segment, config)
@@ -188,6 +233,7 @@ class SegmentGenerator:
 
     @classmethod
     def moa(cls, qualifier: str, amount: Decimal, config: EdifactConfig) -> str:
+        cls.validate_decimal_precision(amount, config)
         q = amount.quantize(Decimal(config.decimal_rounding), rounding=ROUND_HALF_UP)
         segment = f"MOA+{cls.escape_edifact(qualifier)}:{q}'"
         cls.validate_segment_length(segment, config)
@@ -195,50 +241,57 @@ class SegmentGenerator:
 
     @classmethod
     def tax(cls, rate: Decimal, tax_type: str = "VAT", config: Optional[EdifactConfig] = None) -> str:
+        if config is None:
+            config = EdifactConfig()
+        cls.validate_decimal_precision(rate, config)
         if config:
             fmt_rate = rate.quantize(Decimal(config.decimal_rounding), rounding=ROUND_HALF_UP)
         else:
             fmt_rate = rate
         segment = f"TAX+7+{cls.escape_edifact(tax_type)}+++:::{fmt_rate}'"
-        if config:
-            cls.validate_segment_length(segment, config)
+        cls.validate_segment_length(segment, config)
         return segment
 
     @classmethod
     def loc(cls, qualifier: str, location: str, config: Optional[EdifactConfig] = None) -> str:
+        if config is None:
+            config = EdifactConfig()
         segment = f"LOC+{cls.escape_edifact(qualifier)}+{cls.escape_edifact(location)}:92'"
-        if config:
-            cls.validate_segment_length(segment, config)
+        cls.validate_segment_length(segment, config)
         return segment
 
     @classmethod
     def pai(cls, terms: str, config: Optional[EdifactConfig] = None) -> str:
+        if config is None:
+            config = EdifactConfig()
         segment = f"PAI+{cls.escape_edifact(terms)}:3'"
-        if config:
-            cls.validate_segment_length(segment, config)
+        cls.validate_segment_length(segment, config)
         return segment
 
     @classmethod
     def tod(cls, incoterms: str, config: Optional[EdifactConfig] = None) -> str:
+        if config is None:
+            config = EdifactConfig()
         segment = f"TOD+5++{cls.escape_edifact(incoterms)}'"
-        if config:
-            cls.validate_segment_length(segment, config)
+        cls.validate_segment_length(segment, config)
         return segment
 
     @classmethod
     def unt(cls, segment_count: int, message_ref: str, config: Optional[EdifactConfig] = None) -> str:
+        if config is None:
+            config = EdifactConfig()
         segment = f"UNT+{segment_count}+{cls.escape_edifact(message_ref)}'"
-        if config:
-            cls.validate_segment_length(segment, config)
+        cls.validate_segment_length(segment, config)
         return segment
 
     @classmethod
     def ftx(cls, text: str, qualifier: str = "AAI", sequence: int = 1, config: Optional[EdifactConfig] = None) -> str:
-        if len(text) > (config.max_field_length if config else 70):
-            text = text[:config.max_field_length] if config else text[:70]
+        if config is None:
+            config = EdifactConfig()
+        if len(text) > config.max_field_length:
+            text = text[:config.max_field_length]
         segment = f"FTX+{qualifier}+{sequence}+++{cls.escape_edifact(text)}'"
-        if config:
-            cls.validate_segment_length(segment, config)
+        cls.validate_segment_length(segment, config)
         return segment
 
 def validate_date(date_str: str, date_format: str) -> bool:
@@ -255,7 +308,7 @@ def sanitize_input(data: Dict[str, Any]) -> Dict[str, Any]:
     sanitized = {}
     for key, value in data.items():
         if isinstance(value, str):
-            sanitized[key] = re.sub(r'[\x00-\x1F\x7F]', '', value)
+            sanitized[key] = CONTROL_CHAR_REGEX.sub('', value)
         elif isinstance(value, dict):
             sanitized[key] = sanitize_input(value)
         elif isinstance(value, list):
@@ -264,8 +317,16 @@ def sanitize_input(data: Dict[str, Any]) -> Dict[str, Any]:
             sanitized[key] = value
     return sanitized
 
+def validate_with_schema(data: Dict[str, Any]) -> None:
+    try:
+        validate(instance=data, schema=ORDER_SCHEMA)
+    except ValidationError as e:
+        raise EdifactGenerationError(f"Schema validation failed: {e.message}", "SCHEMA_001")
+
 def validate_order_data(data: Dict[str, Any], config: EdifactConfig) -> OrderData:
     data_copy = sanitize_input(copy.deepcopy(data))
+    
+    validate_with_schema(data_copy)
     
     required_fields = ["message_ref", "order_number", "order_date", "parties", "items"]
     missing_fields = [field for field in required_fields if field not in data_copy]
@@ -348,6 +409,8 @@ def generate_edifact_orders(
     config: EdifactConfig = EdifactConfig(),
     output_file: Optional[str] = None,
 ) -> str:
+    logger.info(f"Starting EDIFACT generation for order {data.get('order_number', 'Unknown')}")
+    
     try:
         validated_data = validate_order_data(data, config)
     except EdifactGenerationError as e:
@@ -445,11 +508,13 @@ def generate_edifact_orders(
     if unh_index is None:
         raise EdifactGenerationError("UNH segment missing", "GEN_001")
 
-    segment_count = len(flat_segments) - unh_index
+    segment_count = len(flat_segments) - unh_index + 1
     flat_segments.append(SegmentGenerator.unt(segment_count, validated_data["message_ref"], config))
-    flat_segments.append(SegmentGenerator.unz(1, validated_data["message_ref"]))
+    flat_segments.append(SegmentGenerator.unz(1, validated_data["message_ref"], config))
 
     edifact_message = config.line_ending.join(flat_segments)
+
+    logger.debug(f"Generated {len(flat_segments)} segments")
 
     if output_file:
         try:
@@ -464,10 +529,12 @@ def generate_edifact_orders(
     return edifact_message
 
 if __name__ == "__main__":
+    from datetime import datetime, timedelta
+
     sample_order = {
         "message_ref": "ORD0001",
         "order_number": "2025-0509-A",
-        "order_date": "20250509",
+        "order_date": datetime.now().strftime(DATE_FORMATS["102"]),
         "parties": [
             {
                 "qualifier": "BY",
@@ -491,7 +558,7 @@ if __name__ == "__main__":
                 "unit": "EA"
             },
         ],
-        "delivery_date": "20250515",
+        "delivery_date": (datetime.now() + timedelta(days=7)).strftime(DATE_FORMATS["102"]),
         "currency": "USD",
         "delivery_location": "WAREHOUSE1",
         "payment_terms": "NET30",
