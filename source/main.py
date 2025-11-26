@@ -39,7 +39,37 @@ ORDER_SCHEMA = {
         "payment_terms": {"type": "string", "maxLength": 35},
         "tax_rate": {"type": "number"},
         "special_instructions": {"type": "string"},
-        "incoterms": {"type": "string", "maxLength": 3}
+        "incoterms": {"type": "string", "maxLength": 3},
+        "parties": {
+            "type": "array",
+            "minItems": 1,
+            "items": {
+                "type": "object",
+                "required": ["qualifier", "id"],
+                "properties": {
+                    "qualifier": {"type": "string", "maxLength": 2},
+                    "id": {"type": "string", "maxLength": 35},
+                    "name": {"type": "string"},
+                    "address": {"type": "string"},
+                    "contact": {"type": "string"}
+                }
+            }
+        },
+        "items": {
+            "type": "array",
+            "minItems": 1,
+            "items": {
+                "type": "object",
+                "required": ["product_code", "quantity", "price"],
+                "properties": {
+                    "product_code": {"type": "string", "maxLength": 35},
+                    "description": {"type": "string"},
+                    "quantity": {"type": "number", "minimum": 1},
+                    "price": {"type": "number", "minimum": 0},
+                    "unit": {"type": "string"}
+                }
+            }
+        }
     }
 }
 
@@ -175,7 +205,7 @@ class SegmentGenerator:
         return segment
 
     @classmethod
-    def nad(cls, qualifier: str, party_id: str, name: Optional[str] = None, config: Optional[EdifactConfig] = None) -> List[str]:
+    def nad(cls, qualifier: str, party_id: str, name: Optional[str] = None, config: Optional[EdifactConfig] = None) -> str:
         if config is None:
             config = EdifactConfig()
         base = f"NAD+{cls.escape_edifact(qualifier)}+{cls.escape_edifact(party_id)}::91"
@@ -187,7 +217,7 @@ class SegmentGenerator:
             segment = f"{base}'"
         
         cls.validate_segment_length(segment, config)
-        return [segment]
+        return segment
 
     @classmethod
     def com(cls, contact: str, contact_type: str = "TE", config: Optional[EdifactConfig] = None) -> str:
@@ -294,6 +324,14 @@ class SegmentGenerator:
         cls.validate_segment_length(segment, config)
         return segment
 
+    @classmethod
+    def cux(cls, currency: str, config: Optional[EdifactConfig] = None) -> str:
+        if config is None:
+            config = EdifactConfig()
+        segment = f"CUX+2:{cls.escape_edifact(currency)}:9'"
+        cls.validate_segment_length(segment, config)
+        return segment
+
 def validate_date(date_str: str, date_format: str) -> bool:
     fmt = DATE_FORMATS.get(date_format)
     if not fmt:
@@ -364,6 +402,20 @@ def validate_order_data(data: Dict[str, Any], config: EdifactConfig) -> OrderDat
                     {"item_index": idx, "field": "product_code", "length": len(item["product_code"])}
                 )
             
+            if item["quantity"] <= 0:
+                raise EdifactGenerationError(
+                    f"Item {idx} quantity must be positive",
+                    "VALID_010",
+                    {"item_index": idx, "quantity": item["quantity"]}
+                )
+            
+            if item["price"] < 0:
+                raise EdifactGenerationError(
+                    f"Item {idx} price must be non-negative",
+                    "VALID_011",
+                    {"item_index": idx, "price": item["price"]}
+                )
+            
             converted_item: OrderItem = {
                 "product_code": str(item["product_code"]),
                 "description": str(item.get("description", "")),
@@ -419,28 +471,24 @@ def generate_edifact_orders(
             logger.error(f"Details: {e.details}")
         raise
 
-    segments: List[Union[str, List[str]]] = []
+    segments: List[str] = []
 
     if config.include_una:
         segments.append(SegmentGenerator.una(config))
 
     segments.append(SegmentGenerator.unb(config, validated_data["message_ref"]))
-    segments.extend([
-        SegmentGenerator.unh(validated_data["message_ref"], config),
-        SegmentGenerator.bgm(validated_data["order_number"], "220", config),
-        SegmentGenerator.dtm("137", validated_data["order_date"], config.date_format, config)
-    ])
+    segments.append(SegmentGenerator.unh(validated_data["message_ref"], config))
+    segments.append(SegmentGenerator.bgm(validated_data["order_number"], "220", config))
+    segments.append(SegmentGenerator.dtm("137", validated_data["order_date"], config.date_format, config))
 
     if validated_data.get("delivery_date"):
         segments.append(SegmentGenerator.dtm("2", validated_data["delivery_date"], config.date_format, config))
 
     if validated_data.get("currency"):
-        currency_segment = f"CUX+2:{SegmentGenerator.escape_edifact(validated_data['currency'])}:9'"
-        SegmentGenerator.validate_segment_length(currency_segment, config)
-        segments.append(currency_segment)
+        segments.append(SegmentGenerator.cux(validated_data["currency"], config))
 
     for party in validated_data["parties"]:
-        segments.extend(SegmentGenerator.nad(
+        segments.append(SegmentGenerator.nad(
             party["qualifier"],
             party["id"],
             party.get("name"),
@@ -458,21 +506,18 @@ def generate_edifact_orders(
         unit = item.get("unit", "EA") or "EA"
         line_total = (price * Decimal(quantity)).quantize(Decimal(config.decimal_rounding), rounding=ROUND_HALF_UP)
 
-        segments.extend([
-            SegmentGenerator.lin(idx, item["product_code"], config),
-            SegmentGenerator.imd(item["description"], config),
-            SegmentGenerator.qty(quantity, unit, config),
-            SegmentGenerator.pri(price, config, unit)
-        ])
+        segments.append(SegmentGenerator.lin(idx, item["product_code"], config))
+        if item.get("description"):
+            segments.append(SegmentGenerator.imd(item["description"], config))
+        segments.append(SegmentGenerator.qty(quantity, unit, config))
+        segments.append(SegmentGenerator.pri(price, config, unit))
         total_amount += line_total
 
     if validated_data.get("tax_rate") is not None:
         tax_rate: Decimal = validated_data["tax_rate"]
         tax_amount = (total_amount * tax_rate / Decimal("100")).quantize(Decimal(config.decimal_rounding), rounding=ROUND_HALF_UP)
-        segments.extend([
-            SegmentGenerator.tax(tax_rate, "VAT", config),
-            SegmentGenerator.moa("124", tax_amount, config)
-        ])
+        segments.append(SegmentGenerator.tax(tax_rate, "VAT", config))
+        segments.append(SegmentGenerator.moa("124", tax_amount, config))
         total_amount += tax_amount
 
     if validated_data.get("delivery_location"):
@@ -492,15 +537,8 @@ def generate_edifact_orders(
 
     segments.append(SegmentGenerator.moa("79", total_amount, config))
 
-    flat_segments: List[str] = []
-    for seg in segments:
-        if isinstance(seg, list):
-            flat_segments.extend(seg)
-        else:
-            flat_segments.append(seg)
-
     unh_index = None
-    for i, s in enumerate(flat_segments):
+    for i, s in enumerate(segments):
         if s.startswith("UNH+"):
             unh_index = i
             break
@@ -508,13 +546,13 @@ def generate_edifact_orders(
     if unh_index is None:
         raise EdifactGenerationError("UNH segment missing", "GEN_001")
 
-    segment_count = len(flat_segments) - unh_index + 1
-    flat_segments.append(SegmentGenerator.unt(segment_count, validated_data["message_ref"], config))
-    flat_segments.append(SegmentGenerator.unz(1, validated_data["message_ref"], config))
+    segment_count = len(segments) - unh_index
+    segments.append(SegmentGenerator.unt(segment_count, validated_data["message_ref"], config))
+    segments.append(SegmentGenerator.unz(1, validated_data["message_ref"], config))
 
-    edifact_message = config.line_ending.join(flat_segments)
+    edifact_message = config.line_ending.join(segments)
 
-    logger.debug(f"Generated {len(flat_segments)} segments")
+    logger.debug(f"Generated {len(segments)} segments")
 
     if output_file:
         try:
